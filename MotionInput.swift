@@ -1,6 +1,7 @@
 import Cocoa
 import CoreMotion
 import GameController
+import IOKit
 import IOKit.hid
 
 enum InputMode: String {
@@ -14,11 +15,14 @@ final class MotionHub {
     static let shared = MotionHub()
 
     private let headphones = CMHeadphoneMotionManager()
-    private var hidManager: IOHIDManager?
-    private var hidBuffers: [UnsafeMutablePointer<UInt8>] = []
     private var headphoneSample: CMDeviceMotion?
+    private var hidDevices: [IOHIDDevice] = []
+    private var hidBuffers: [UnsafeMutablePointer<UInt8>] = []
     private var hidAccel: (x: Double, y: Double, z: Double)?
     private var hidHaveSample = false
+    private var hidReports: UInt64 = 0
+    private var hidSkip = 0
+    private var lastStatusWrite: CFTimeInterval = 0
 
     private(set) var gravityX: Double = 0
     private(set) var gravityY: Double = -1
@@ -79,11 +83,13 @@ final class MotionHub {
         if headphones.isDeviceMotionAvailable {
             headphones.stopDeviceMotionUpdates()
         }
-        if let manager = hidManager {
-            IOHIDManagerUnscheduleFromRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
-            IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+        for hid in hidDevices {
+            IOHIDDeviceUnscheduleFromRunLoop(hid, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
+            IOHIDDeviceClose(hid, 0)
         }
-        hidManager = nil
+        hidDevices.removeAll()
+        hidBuffers.forEach { $0.deallocate() }
+        hidBuffers.removeAll()
     }
 
     func queuePull(side: CradleSide, count: Int) {
@@ -103,7 +109,8 @@ final class MotionHub {
         let effective: InputMode
         switch mode {
         case .auto:
-            if hidHaveSample || controllerAvailable { effective = .accelerometer }
+            if hidHaveSample { effective = .accelerometer }
+            else if controllerAvailable { effective = .accelerometer }
             else if headphoneSample != nil { effective = .headphones }
             else { effective = .mouse }
         default:
@@ -113,9 +120,9 @@ final class MotionHub {
         switch effective {
         case .accelerometer:
             if applyHIDAccel(sensitivity: s) {
-                // ok
+                break
             } else if applyController(sensitivity: s) {
-                // ok
+                break
             } else {
                 applyMouseTilt(sensitivity: s)
                 sourceName = "Mouse tilt (no Mac IMU stream)"
@@ -129,17 +136,23 @@ final class MotionHub {
             applyMouseTilt(sensitivity: s)
             sourceName = "Mouse tilt"
         }
+
+        let now = CACurrentMediaTime()
+        if now - lastStatusWrite > 1.0 {
+            lastStatusWrite = now
+            writeStatus()
+        }
     }
 
     private func applyHIDAccel(sensitivity s: Double) -> Bool {
         guard let a = hidAccel, hidHaveSample else { return false }
-        let tilt = atan2(a.x, max(0.15, abs(a.z) + abs(a.y)))
+        let tilt = atan2(a.x, max(0.15, abs(a.z)))
         gravityX = sin(tilt) * s
         gravityY = -cos(tilt)
         if haveLastAccel {
             let jerk = a.x - lastAccelX
-            if abs(jerk) > 0.06 {
-                jerkImpulse = jerk * 2.8 * s
+            if abs(jerk) > 0.045 {
+                jerkImpulse = jerk * 4.5 * s
             }
         }
         lastAccelX = a.x
@@ -203,54 +216,86 @@ final class MotionHub {
         haveLastMouse = true
     }
 
-    // MARK: - Built-in AOP accelerometer (HID product "accel")
+    // MARK: - Apple SPU accelerometer (AppleSPUHIDDevice, usage 0xFF00/3)
 
     private func startHIDAccelerometer() {
-        let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
-        hidManager = manager
-        let match: [String: Any] = [kIOHIDProductKey as String: "accel"]
-        IOHIDManagerSetDeviceMatching(manager, match as CFDictionary)
-        let ctx = Unmanaged.passUnretained(self).toOpaque()
-        IOHIDManagerRegisterDeviceMatchingCallback(manager, { context, _, _, device in
-            Unmanaged<MotionHub>.fromOpaque(context!).takeUnretainedValue().attachAccel(device)
-        }, ctx)
-        IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
-        _ = IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
-        accelerometerAvailable = true
+        wakeSPUDrivers()
+        attachAccelDevice()
     }
 
-    private func attachAccel(_ device: IOHIDDevice) {
-        let name = (IOHIDDeviceGetProperty(device, kIOHIDProductKey as CFString) as? String) ?? ""
-        guard name == "accel" else { return }
-        let open = IOHIDDeviceOpen(device, IOOptionBits(kIOHIDOptionsTypeNone))
-        guard open == kIOReturnSuccess else { return }
-        let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: 32)
-        buf.initialize(repeating: 0, count: 32)
-        hidBuffers.append(buf)
-        let ctx = Unmanaged.passUnretained(self).toOpaque()
-        IOHIDDeviceRegisterInputReportCallback(device, buf, 32, { context, _, _, _, _, report, len in
-            Unmanaged<MotionHub>.fromOpaque(context!).takeUnretainedValue().handleAccelReport(report, length: Int(len))
-        }, ctx)
+    private func wakeSPUDrivers() {
+        guard let matching = IOServiceMatching("AppleSPUHIDDriver") else { return }
+        var it: io_iterator_t = 0
+        guard IOServiceGetMatchingServices(kIOMainPortDefault, matching, &it) == KERN_SUCCESS else { return }
+        while true {
+            let svc = IOIteratorNext(it)
+            if svc == 0 { break }
+            for (k, v) in [
+                ("SensorPropertyReportingState", Int32(1)),
+                ("SensorPropertyPowerState", Int32(1)),
+                ("ReportInterval", Int32(1000))
+            ] {
+                IORegistryEntrySetCFProperty(svc, k as CFString, v as CFNumber)
+            }
+            IOObjectRelease(svc)
+        }
+        IOObjectRelease(it)
     }
 
-    /// Apple SPU accel HID report is a 22-byte vendor blob. When the OS
-    /// actually streams it, try int16le triplets at a few offsets.
+    private func attachAccelDevice() {
+        guard let matching = IOServiceMatching("AppleSPUHIDDevice") else { return }
+        var it: io_iterator_t = 0
+        guard IOServiceGetMatchingServices(kIOMainPortDefault, matching, &it) == KERN_SUCCESS else { return }
+        while true {
+            let svc = IOIteratorNext(it)
+            if svc == 0 { break }
+            let up = hidPropUInt32(svc, "PrimaryUsagePage")
+            let u = hidPropUInt32(svc, "PrimaryUsage")
+            if up == 0xFF00 && u == 3, let hid = IOHIDDeviceCreate(kCFAllocatorDefault, svc) {
+                if IOHIDDeviceOpen(hid, 0) == kIOReturnSuccess {
+                    let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: 4096)
+                    buf.initialize(repeating: 0, count: 4096)
+                    hidBuffers.append(buf)
+                    hidDevices.append(hid)
+                    accelerometerAvailable = true
+                    let ctx = Unmanaged.passUnretained(self).toOpaque()
+                    IOHIDDeviceRegisterInputReportWithTimeStampCallback(hid, buf, 4096, { context, _, _, _, _, report, len, _ in
+                        Unmanaged<MotionHub>.fromOpaque(context!).takeUnretainedValue()
+                            .handleAccelReport(report, length: Int(len))
+                    }, ctx)
+                    IOHIDDeviceScheduleWithRunLoop(hid, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
+                }
+            }
+            IOObjectRelease(svc)
+        }
+        IOObjectRelease(it)
+    }
+
+    private func hidPropUInt32(_ svc: io_object_t, _ key: String) -> UInt32 {
+        guard let unmanaged = IORegistryEntryCreateCFProperty(svc, key as CFString, kCFAllocatorDefault, 0) else { return 0 }
+        let value = unmanaged.takeRetainedValue()
+        return (value as? NSNumber)?.uint32Value ?? 0
+    }
+
+    /// 22-byte BMI286 report: int32le xyz at bytes 6,10,14; divide by 65536 → g.
     private func handleAccelReport(_ report: UnsafePointer<UInt8>, length: Int) {
-        guard length >= 6 else { return }
-        func i16(_ o: Int) -> Double {
-            guard o + 1 < length else { return 0 }
-            let lo = Int16(bitPattern: UInt16(report[o]) | (UInt16(report[o + 1]) << 8))
-            return Double(lo)
+        guard length >= 22 else { return }
+        hidSkip += 1
+        if hidSkip < 8 { return }
+        hidSkip = 0
+        hidReports &+= 1
+        func i32(_ o: Int) -> Int32 {
+            Int32(bitPattern:
+                UInt32(report[o]) |
+                UInt32(report[o + 1]) << 8 |
+                UInt32(report[o + 2]) << 16 |
+                UInt32(report[o + 3]) << 24)
         }
-        // Prefer a 6-byte xyz packed after an 8-byte timestamp, else at offset 0.
-        var samples = [(i16(8), i16(10), i16(12)), (i16(0), i16(2), i16(4))]
-        if length >= 22 {
-            samples.append((i16(16), i16(18), i16(20)))
-        }
-        let picked = samples.max(by: { hypot($0.0, hypot($0.1, $0.2)) < hypot($1.0, hypot($1.1, $1.2)) })!
-        let mag = hypot(picked.0, hypot(picked.1, picked.2))
-        guard mag > 20 else { return }
-        hidAccel = (picked.0 / mag, picked.1 / mag, picked.2 / mag)
+        hidAccel = (
+            Double(i32(6)) / 65536.0,
+            Double(i32(10)) / 65536.0,
+            Double(i32(14)) / 65536.0
+        )
         hidHaveSample = true
     }
 
@@ -258,17 +303,25 @@ final class MotionHub {
         let dir = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/NewtonsCradle")
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let payload: [String: Any] = [
+        var payload: [String: Any] = [
             "accelerometerAvailable": accelerometerAvailable,
             "hidStreaming": hidHaveSample,
+            "hidReports": hidReports,
             "headphonesAvailable": headphonesAvailable,
             "controllerAvailable": controllerAvailable,
             "source": sourceName,
             "mode": mode.rawValue,
             "paused": paused,
             "autoDemo": autoDemo,
-            "sensitivity": sensitivity
+            "sensitivity": sensitivity,
+            "gravityX": gravityX,
+            "gravityY": gravityY
         ]
+        if let a = hidAccel {
+            payload["gX"] = a.x
+            payload["gY"] = a.y
+            payload["gZ"] = a.z
+        }
         if let data = try? JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted]) {
             try? data.write(to: dir.appendingPathComponent("status.json"))
         }
