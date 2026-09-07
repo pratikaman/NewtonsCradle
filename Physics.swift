@@ -41,12 +41,13 @@ final class Simulation {
 
     func layout(in rect: CGRect) {
         let count = 5
-        let R = Double(min(rect.width, rect.height)) * 0.042
-        let L = R * 7.35
+        let R = Double(min(rect.width, rect.height)) * 0.050
+        let L = R * 7.1
         let spacing = 2 * R
         let total = spacing * Double(count - 1)
         let startX = Double(rect.midX) - total / 2
-        let pivotY = Double(rect.midY) + L * 0.18
+        let deskY = Double(rect.minY) + Double(rect.height) * 0.34
+        let pivotY = deskY + L + R * 2.55
 
         if balls.count != count {
             balls = (0..<count).map { i in

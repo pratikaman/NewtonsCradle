@@ -17,7 +17,7 @@ final class WallpaperWindow: NSWindow {
         isReleasedWhenClosed = false
         isRestorable = false
         animationBehavior = .none
-        backgroundColor = NSColor(calibratedRed: 0.075, green: 0.045, blue: 0.028, alpha: 1)
+        backgroundColor = NSColor(calibratedRed: 0.035, green: 0.028, blue: 0.022, alpha: 1)
         hidesOnDeactivate = false
         contentView = CradleView(frame: NSRect(origin: .zero, size: screen.frame.size))
         orderFrontRegardless()
