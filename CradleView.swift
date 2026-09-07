@@ -1,384 +1,324 @@
 import Cocoa
+import SceneKit
+import simd
 
-final class CradleView: NSView {
+final class CradleView: SCNView {
     let sim = Simulation()
-    private var bg: NSImage?
-    private var lastSize: CGSize = .zero
-    private var lastScale: CGFloat = 0
+    private var builtFor: CGSize = .zero
+    private var ballNodes: [SCNNode] = []
+    private var stringNodes: [[SCNNode]] = []
+    private var cradleRoot = SCNNode()
 
-    override var isOpaque: Bool { true }
-    override var wantsDefaultClipping: Bool { false }
+    override init(frame: NSRect) {
+        super.init(frame: frame, options: [
+            SCNView.Option.preferredRenderingAPI.rawValue: SCNRenderingAPI.metal.rawValue
+        ])
+        commonInit()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        commonInit()
+    }
+
+    private func commonInit() {
+        allowsCameraControl = false
+        antialiasingMode = .multisampling4X
+        backgroundColor = NSColor(calibratedRed: 0.045, green: 0.035, blue: 0.028, alpha: 1)
+        autoenablesDefaultLighting = false
+        isPlaying = true
+        rendersContinuously = true
+        isJitteringEnabled = true
+        wantsLayer = true
+        layer?.isOpaque = true
+    }
 
     override func layout() {
         super.layout()
         sim.layout(in: bounds)
-        let scale = window?.backingScaleFactor ?? 2
-        if bounds.size != lastSize || scale != lastScale {
-            lastSize = bounds.size
-            lastScale = scale
-            bg = nil
+        if bounds.size != builtFor, bounds.width > 8 {
+            rebuildScene()
         }
     }
 
     func tick(dt: Double) {
-        if bounds.width > 8 {
-            sim.layout(in: bounds)
-        }
+        if bounds.width > 8 { sim.layout(in: bounds) }
+        if builtFor != bounds.size, bounds.width > 8 { rebuildScene() }
         if !MotionHub.shared.paused {
             sim.step(dt: dt, hub: MotionHub.shared)
         }
-        needsDisplay = true
-    }
-
-    override func draw(_ dirtyRect: NSRect) {
-        NSGraphicsContext.current?.shouldAntialias = true
-        NSGraphicsContext.current?.imageInterpolation = .high
-        if bg == nil { rebuildBackground() }
-        bg?.draw(in: bounds, from: .zero, operation: .copy, fraction: 1)
-        guard !sim.balls.isEmpty else { return }
-        drawStringsAndBalls()
-    }
-
-    private func rebuildBackground() {
-        let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
-        let w = max(1, Int(bounds.width * scale))
-        let h = max(1, Int(bounds.height * scale))
-        guard let rep = NSBitmapImageRep(
-            bitmapDataPlanes: nil, pixelsWide: w, pixelsHigh: h,
-            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
-            colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
-        ) else { return }
-        rep.size = bounds.size
-        NSGraphicsContext.saveGraphicsState()
-        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
-        NSGraphicsContext.current?.shouldAntialias = true
-        drawRoomAndDesk(in: bounds)
-        drawFrame()
-        NSGraphicsContext.restoreGraphicsState()
-        let img = NSImage(size: bounds.size)
-        img.addRepresentation(rep)
-        bg = img
+        syncNodes()
     }
 
     // MARK: - Scene
 
-    private func drawRoomAndDesk(in rect: NSRect) {
-        NSColor(calibratedRed: 0.035, green: 0.028, blue: 0.022, alpha: 1).setFill()
-        rect.fill()
+    private func rebuildScene() {
+        guard sim.balls.count >= 2 else { return }
+        builtFor = bounds.size
 
-        // Warm key from a high window, left of center.
-        let roomLight = NSGradient(colors: [
-            NSColor(calibratedRed: 0.22, green: 0.14, blue: 0.08, alpha: 0.55),
-            NSColor(calibratedRed: 0.06, green: 0.04, blue: 0.03, alpha: 0.0)
-        ])
-        let lightPath = NSBezierPath(rect: rect)
-        roomLight?.draw(in: lightPath, relativeCenterPosition: NSPoint(x: -0.28, y: 0.55))
-
-        guard let first = sim.balls.first else { return }
-        let r = CGFloat(first.radius)
-        let deskTop = CGFloat(first.pivotY - first.length) - r * 2.35
-        let desk = NSRect(x: rect.minX, y: rect.minY, width: rect.width, height: max(8, deskTop - rect.minY))
-
-        NSColor(calibratedRed: 0.09, green: 0.055, blue: 0.032, alpha: 1).setFill()
-        desk.fill()
-
-        let deskWash = NSGradient(colors: [
-            NSColor(calibratedRed: 0.16, green: 0.10, blue: 0.055, alpha: 1),
-            NSColor(calibratedRed: 0.08, green: 0.048, blue: 0.028, alpha: 1),
-            NSColor(calibratedRed: 0.04, green: 0.025, blue: 0.016, alpha: 1)
-        ])
-        deskWash?.draw(in: desk, angle: 90)
-
-        // Horizontal grain — a desk, not a wall.
-        var y = desk.minY
-        var i = 0
-        let step = max(0.7, desk.height / 220)
-        while y < desk.maxY {
-            let n = noise(i &+ 17)
-            let a = 0.028 + n * 0.07
-            NSColor(calibratedRed: 0.38, green: 0.22, blue: 0.10, alpha: a).setFill()
-            NSRect(x: desk.minX, y: y, width: desk.width, height: step * (0.45 + n * 0.8)).fill()
-            y += step * (1.15 + n * 1.8)
-            i += 1
+        let scene = SCNScene()
+        scene.background.contents = NSColor(calibratedRed: 0.045, green: 0.035, blue: 0.028, alpha: 1)
+        if let hdr = Bundle.main.url(forResource: "env", withExtension: "hdr") {
+            scene.lightingEnvironment.contents = hdr
+        } else if let jpg = Bundle.main.url(forResource: "env", withExtension: "jpg") {
+            scene.lightingEnvironment.contents = jpg
         }
+        scene.lightingEnvironment.intensity = 1.15
 
-        // Pool of window light on the desk under the cradle.
-        let pool = NSBezierPath(ovalIn: NSRect(
-            x: rect.midX - r * 9,
-            y: deskTop - r * 3.4,
-            width: r * 18,
-            height: r * 4.2
-        ))
-        NSGradient(colors: [
-            NSColor(calibratedRed: 0.42, green: 0.28, blue: 0.14, alpha: 0.28),
-            NSColor(calibratedRed: 0.18, green: 0.10, blue: 0.05, alpha: 0)
-        ])?.draw(in: pool, relativeCenterPosition: .zero)
+        cradleRoot = SCNNode()
+        scene.rootNode.addChildNode(cradleRoot)
 
-        // Horizon catch on the desk edge.
-        NSColor(calibratedRed: 0.55, green: 0.38, blue: 0.18, alpha: 0.18).setFill()
-        NSRect(x: desk.minX, y: desk.maxY - 1.2, width: desk.width, height: 1.2).fill()
-
-        // Falloff into the room.
-        let vignette = NSGradient(
-            starting: NSColor.clear,
-            ending: NSColor(calibratedRed: 0.01, green: 0.008, blue: 0.005, alpha: 0.72)
-        )
-        vignette?.draw(in: NSBezierPath(rect: rect), relativeCenterPosition: NSPoint(x: 0, y: -0.15))
-    }
-
-    private func noise(_ i: Int) -> CGFloat {
-        var x = (i &* 1103515245) &+ 12345
-        x = (x ^ (x >> 16)) &* 0x7feb352d
-        return CGFloat(x & 0xffff) / 65535.0
-    }
-
-    // MARK: - Frame (dual rail, four posts, felted plinth)
-
-    private struct FrameGeom {
-        var r: CGFloat
-        var leftX: CGFloat
-        var rightX: CGFloat
-        var frontY: CGFloat
-        var backY: CGFloat
-        var postBottom: CGFloat
-        var postW: CGFloat
-        var deskTop: CGFloat
-    }
-
-    private func frameGeom() -> FrameGeom? {
-        guard sim.balls.count >= 2, let first = sim.balls.first, let last = sim.balls.last else { return nil }
+        let first = sim.balls[0]
+        let last = sim.balls[sim.balls.count - 1]
         let r = CGFloat(first.radius)
+        let railZ = r * 0.95
+        let attach = r * 0.16
+        let deskY = CGFloat(first.pivotY - first.length) - r * 2.2
         let frontY = CGFloat(first.pivotY)
-        return FrameGeom(
-            r: r,
-            leftX: CGFloat(first.pivotX) - r * 2.15,
-            rightX: CGFloat(last.pivotX) + r * 2.15,
-            frontY: frontY,
-            backY: frontY + r * 0.42,
-            postBottom: CGFloat(first.pivotY) - CGFloat(first.length) - r * 2.15,
-            postW: r * 0.42,
-            deskTop: CGFloat(first.pivotY - first.length) - r * 2.35
-        )
+        let leftX = CGFloat(first.pivotX) - r * 2.2
+        let rightX = CGFloat(last.pivotX) + r * 2.2
+        let postBottom = deskY + r * 0.15
+        let midX = (leftX + rightX) / 2
+        let midY = (deskY + frontY) / 2
+
+        addDesk(deskY: deskY, r: r)
+        addPlinth(leftX: leftX, rightX: rightX, deskY: deskY, r: r)
+        addPostsAndRails(leftX: leftX, rightX: rightX, frontY: frontY, postBottom: postBottom, railZ: railZ, r: r)
+
+        ballNodes = []
+        stringNodes = []
+        for b in sim.balls {
+            let sphere = SCNSphere(radius: 1)
+            sphere.segmentCount = 48
+            sphere.materials = [chromeMaterial()]
+            let node = SCNNode(geometry: sphere)
+            node.castsShadow = true
+            cradleRoot.addChildNode(node)
+            ballNodes.append(node)
+
+            var wires: [SCNNode] = []
+            for _ in 0..<2 {
+                let cyl = SCNCylinder(radius: 1, height: 1)
+                cyl.materials = [wireMaterial()]
+                let wn = SCNNode(geometry: cyl)
+                wn.castsShadow = false
+                cradleRoot.addChildNode(wn)
+                wires.append(wn)
+            }
+            stringNodes.append(wires)
+            _ = (b, attach, railZ)
+        }
+
+        let key = SCNNode()
+        key.light = SCNLight()
+        key.light?.type = .directional
+        key.light?.color = NSColor(calibratedRed: 1.0, green: 0.91, blue: 0.78, alpha: 1)
+        key.light?.intensity = 650
+        key.light?.castsShadow = true
+        key.light?.shadowMode = .deferred
+        key.light?.shadowSampleCount = 16
+        key.light?.shadowRadius = 6
+        key.light?.shadowMapSize = CGSize(width: 2048, height: 2048)
+        key.light?.shadowColor = NSColor(calibratedWhite: 0, alpha: 0.55)
+        key.eulerAngles = SCNVector3(-0.85, 0.55, 0.12)
+        scene.rootNode.addChildNode(key)
+
+        let fill = SCNNode()
+        fill.light = SCNLight()
+        fill.light?.type = .ambient
+        fill.light?.color = NSColor(calibratedRed: 0.35, green: 0.28, blue: 0.22, alpha: 1)
+        fill.light?.intensity = 180
+        scene.rootNode.addChildNode(fill)
+
+        let camNode = SCNNode()
+        let cam = SCNCamera()
+        cam.zNear = 2
+        cam.zFar = 8000
+        cam.fieldOfView = 32
+        cam.wantsHDR = true
+        cam.wantsExposureAdaptation = false
+        cam.exposureOffset = -0.15
+        cam.bloomIntensity = 0.22
+        cam.bloomThreshold = 0.85
+        cam.bloomBlurRadius = 6
+        cam.vignettingIntensity = 0.45
+        cam.vignettingPower = 0.8
+        cam.colorFringeIntensity = 0.15
+        camNode.camera = cam
+        let dist = max(bounds.width, bounds.height) * 0.72
+        camNode.position = SCNVector3(midX + r * 1.8, midY + r * 3.2, dist)
+        camNode.look(at: SCNVector3(midX, midY - r * 0.6, 0))
+        scene.rootNode.addChildNode(camNode)
+        pointOfView = camNode
+
+        self.scene = scene
+        syncNodes()
     }
 
-    private func drawFrame() {
-        guard let g = frameGeom() else { return }
-        let brassLite = NSColor(calibratedRed: 0.86, green: 0.70, blue: 0.42, alpha: 1)
-        let brass = NSColor(calibratedRed: 0.62, green: 0.46, blue: 0.24, alpha: 1)
-        let brassDark = NSColor(calibratedRed: 0.28, green: 0.18, blue: 0.08, alpha: 1)
-        let steelLite = NSColor(calibratedRed: 0.62, green: 0.60, blue: 0.56, alpha: 1)
-        let steel = NSColor(calibratedRed: 0.32, green: 0.30, blue: 0.28, alpha: 1)
-        let steelDark = NSColor(calibratedRed: 0.10, green: 0.09, blue: 0.08, alpha: 1)
+    private func addDesk(deskY: CGFloat, r: CGFloat) {
+        let plane = SCNPlane(width: bounds.width * 1.6, height: bounds.width * 1.6)
+        plane.materials = [woodMaterial(repeat: 6)]
+        let node = SCNNode(geometry: plane)
+        node.eulerAngles = SCNVector3(-CGFloat.pi / 2, 0, 0)
+        node.position = SCNVector3(bounds.midX, deskY, 0)
+        node.castsShadow = false
+        cradleRoot.addChildNode(node)
 
-        func metalPost(x: CGFloat, y0: CGFloat, y1: CGFloat, width: CGFloat, back: Bool) {
-            let inset: CGFloat = back ? width * 0.12 : 0
-            let p = NSRect(x: x - width / 2 + inset, y: y0, width: width - inset * 2, height: y1 - y0)
-            let path = NSBezierPath(roundedRect: p, xRadius: width * 0.45, yRadius: width * 0.12)
-            let colors = back
-                ? [steel, steelDark, steelDark]
-                : [steelLite, steel, steelDark]
-            NSGradient(colors: colors)?.draw(in: path, angle: 0)
-            if !back {
-                NSColor(calibratedWhite: 1, alpha: 0.18).setFill()
-                NSRect(x: p.minX + p.width * 0.18, y: p.minY, width: 1.2, height: p.height).fill()
+        // Dark back wall so chrome doesn't reflect a void.
+        let wall = SCNPlane(width: bounds.width * 1.6, height: bounds.height * 1.2)
+        let wm = SCNMaterial()
+        wm.lightingModel = .physicallyBased
+        wm.diffuse.contents = NSColor(calibratedRed: 0.07, green: 0.055, blue: 0.04, alpha: 1)
+        wm.roughness.contents = 0.9
+        wm.metalness.contents = 0.0
+        wall.materials = [wm]
+        let wallNode = SCNNode(geometry: wall)
+        wallNode.position = SCNVector3(bounds.midX, deskY + bounds.height * 0.4, -r * 14)
+        wallNode.castsShadow = false
+        cradleRoot.addChildNode(wallNode)
+    }
+
+    private func addPlinth(leftX: CGFloat, rightX: CGFloat, deskY: CGFloat, r: CGFloat) {
+        let w = (rightX - leftX) + r * 3.8
+        let d = r * 3.4
+        let h = r * 0.55
+        let box = SCNBox(width: w, height: h, length: d, chamferRadius: r * 0.06)
+        box.materials = [woodMaterial(repeat: 1.4)]
+        let node = SCNNode(geometry: box)
+        node.position = SCNVector3((leftX + rightX) / 2, deskY + h / 2, 0)
+        node.castsShadow = true
+        cradleRoot.addChildNode(node)
+
+        let felt = SCNBox(width: w - r * 0.5, height: r * 0.06, length: d - r * 0.5, chamferRadius: r * 0.02)
+        let fm = SCNMaterial()
+        fm.lightingModel = .physicallyBased
+        fm.diffuse.contents = NSColor(calibratedRed: 0.08, green: 0.10, blue: 0.07, alpha: 1)
+        fm.roughness.contents = 1.0
+        fm.metalness.contents = 0.0
+        felt.materials = [fm]
+        let fn = SCNNode(geometry: felt)
+        fn.position = SCNVector3((leftX + rightX) / 2, deskY + h + r * 0.02, 0)
+        fn.castsShadow = false
+        cradleRoot.addChildNode(fn)
+    }
+
+    private func addPostsAndRails(leftX: CGFloat, rightX: CGFloat, frontY: CGFloat, postBottom: CGFloat, railZ: CGFloat, r: CGFloat) {
+        let postR = r * 0.16
+        let height = frontY - postBottom + r * 0.25
+        for x in [leftX, rightX] {
+            for z in [-railZ, railZ] {
+                let post = SCNCylinder(radius: postR, height: height)
+                post.materials = [steelMaterial()]
+                let n = SCNNode(geometry: post)
+                n.position = SCNVector3(x, postBottom + height / 2, z)
+                n.castsShadow = true
+                cradleRoot.addChildNode(n)
             }
         }
-
-        func rail(y: CGFloat, back: Bool) {
-            let h = g.r * (back ? 0.28 : 0.34)
-            let bar = NSRect(x: g.leftX - g.postW * 0.15, y: y - h * 0.35, width: g.rightX - g.leftX + g.postW * 0.3, height: h)
-            let path = NSBezierPath(roundedRect: bar, xRadius: h * 0.4, yRadius: h * 0.4)
-            let colors = back
-                ? [brass, brassDark]
-                : [brassLite, brass, brassDark, brass]
-            NSGradient(colors: colors)?.draw(in: path, angle: back ? 0 : 90)
-            if !back {
-                NSColor(calibratedRed: 1, green: 0.92, blue: 0.7, alpha: 0.35).setFill()
-                NSRect(x: bar.minX + 4, y: bar.maxY - 1.4, width: bar.width - 8, height: 1.1).fill()
-            }
-        }
-
-        // Back structure first.
-        metalPost(x: g.leftX, y0: g.postBottom, y1: g.backY + g.r * 0.25, width: g.postW, back: true)
-        metalPost(x: g.rightX, y0: g.postBottom, y1: g.backY + g.r * 0.25, width: g.postW, back: true)
-        rail(y: g.backY, back: true)
-
-        // Plinth
-        let base = NSRect(
-            x: g.leftX - g.r * 1.8,
-            y: g.postBottom - g.r * 0.22,
-            width: (g.rightX - g.leftX) + g.r * 3.6,
-            height: g.r * 1.05
-        )
-        let basePath = NSBezierPath(roundedRect: base, xRadius: g.r * 0.10, yRadius: g.r * 0.10)
-        NSGradient(colors: [
-            NSColor(calibratedRed: 0.28, green: 0.16, blue: 0.08, alpha: 1),
-            NSColor(calibratedRed: 0.12, green: 0.07, blue: 0.035, alpha: 1),
-            NSColor(calibratedRed: 0.06, green: 0.035, blue: 0.018, alpha: 1)
-        ])?.draw(in: basePath, angle: 90)
-
-        let felt = NSRect(x: base.minX + g.r * 0.35, y: base.maxY - g.r * 0.28, width: base.width - g.r * 0.7, height: g.r * 0.22)
-        let feltPath = NSBezierPath(roundedRect: felt, xRadius: g.r * 0.04, yRadius: g.r * 0.04)
-        NSColor(calibratedRed: 0.07, green: 0.09, blue: 0.06, alpha: 1).setFill()
-        feltPath.fill()
-        NSColor(calibratedRed: 0.12, green: 0.16, blue: 0.10, alpha: 0.55).setFill()
-        NSRect(x: felt.minX, y: felt.maxY - 1, width: felt.width, height: 1).fill()
-
-        // Front posts + rail
-        metalPost(x: g.leftX, y0: g.postBottom, y1: g.frontY + g.r * 0.38, width: g.postW, back: false)
-        metalPost(x: g.rightX, y0: g.postBottom, y1: g.frontY + g.r * 0.38, width: g.postW, back: false)
-        rail(y: g.frontY, back: false)
-
-        // Pivot beads on the front rail
-        for b in sim.balls {
-            let capR = g.r * 0.13
-            let cap = NSRect(x: CGFloat(b.pivotX) - capR, y: g.frontY - capR * 0.3, width: capR * 2, height: capR * 2)
-            NSBezierPath(ovalIn: cap).fill(with: brassDark)
-            NSColor(calibratedRed: 0.95, green: 0.82, blue: 0.52, alpha: 0.85).setFill()
-            NSBezierPath(ovalIn: cap.insetBy(dx: capR * 0.35, dy: capR * 0.4)).fill()
+        let railLen = rightX - leftX + r * 0.5
+        let railR = r * 0.11
+        for z in [-railZ, railZ] {
+            let rail = SCNCylinder(radius: railR, height: railLen)
+            rail.materials = [brassMaterial()]
+            let n = SCNNode(geometry: rail)
+            n.position = SCNVector3((leftX + rightX) / 2, frontY, z)
+            n.eulerAngles = SCNVector3(0, 0, CGFloat.pi / 2)
+            n.castsShadow = true
+            cradleRoot.addChildNode(n)
         }
     }
 
-    // MARK: - Moving parts
-
-    private func drawStringsAndBalls() {
-        guard let g = frameGeom() else { return }
-        let attach = g.r * 0.20
-
-        for b in sim.balls {
-            let p = b.position
-            let top = CGPoint(
-                x: p.x,
-                y: p.y + CGFloat(b.radius) * 0.88
-            )
-            func wire(_ from: CGPoint, alpha: CGFloat, width: CGFloat) {
-                let path = NSBezierPath()
-                path.move(to: from)
-                path.line(to: top)
-                path.lineWidth = width
-                path.lineCapStyle = .round
-                NSColor(calibratedRed: 0.72, green: 0.68, blue: 0.60, alpha: alpha).setStroke()
-                path.stroke()
-            }
-            // Back string, then front pair — the classic two-string hang.
-            wire(CGPoint(x: CGFloat(b.pivotX), y: g.backY), alpha: 0.38, width: max(0.6, g.r * 0.028))
-            wire(CGPoint(x: CGFloat(b.pivotX) - attach, y: g.frontY), alpha: 0.78, width: max(0.8, g.r * 0.034))
-            wire(CGPoint(x: CGFloat(b.pivotX) + attach, y: g.frontY), alpha: 0.78, width: max(0.8, g.r * 0.034))
-        }
-
+    private func syncNodes() {
+        guard ballNodes.count == sim.balls.count else { return }
+        let first = sim.balls[0]
+        let r = CGFloat(first.radius)
+        let railZ = r * 0.95
         for (i, b) in sim.balls.enumerated() {
-            drawBall(b, index: i)
+            let p = b.position
+            ballNodes[i].position = SCNVector3(p.x, p.y, 0)
+            ballNodes[i].scale = SCNVector3(r, r, r)
+            let top = SCNVector3(p.x, p.y + r * 0.92, 0)
+            let back = SCNVector3(b.pivotX, b.pivotY, -railZ)
+            let front = SCNVector3(b.pivotX, b.pivotY, railZ)
+            if stringNodes[i].count == 2 {
+                placeWire(stringNodes[i][0], from: back, to: top, radius: r * 0.016)
+                placeWire(stringNodes[i][1], from: front, to: top, radius: r * 0.016)
+            }
         }
     }
 
-    private func drawBall(_ b: Ball, index: Int) {
-        let p = b.position
-        let r = CGFloat(b.radius)
-        let lift = CGFloat((1 - cos(b.theta)) * b.length)
-
-        // Contact shadow on the felt — tighter and darker when hanging, softer when raised.
-        let shadowScale = 1 + lift / (r * 14)
-        let shadowAlpha = 0.38 / Double(1 + lift / (r * 8))
-        let squash = NSRect(
-            x: p.x - r * 0.95 * shadowScale,
-            y: CGFloat(b.pivotY - b.length) - r * 1.85,
-            width: r * 1.9 * shadowScale,
-            height: r * 0.32 * shadowScale
-        )
-        NSColor(calibratedWhite: 0, alpha: CGFloat(shadowAlpha)).setFill()
-        NSBezierPath(ovalIn: squash).fill()
-
-        let rect = NSRect(x: p.x - r, y: p.y - r, width: r * 2, height: r * 2)
-        let ball = NSBezierPath(ovalIn: rect)
-
-        // Cool chrome body.
-        NSGradient(
-            colors: [
-                NSColor(calibratedRed: 0.92, green: 0.93, blue: 0.95, alpha: 1),
-                NSColor(calibratedRed: 0.48, green: 0.50, blue: 0.54, alpha: 1),
-                NSColor(calibratedRed: 0.16, green: 0.16, blue: 0.18, alpha: 1),
-                NSColor(calibratedRed: 0.04, green: 0.04, blue: 0.045, alpha: 1)
-            ],
-            atLocations: [0.0, 0.32, 0.68, 1.0],
-            colorSpace: .genericRGB
-        )?.draw(in: ball, relativeCenterPosition: NSPoint(x: -0.36, y: 0.44))
-
-        // Warm wood bounce from below.
-        let bounce = NSBezierPath(ovalIn: NSRect(
-            x: p.x - r * 0.72,
-            y: p.y - r * 0.92,
-            width: r * 1.44,
-            height: r * 0.70
-        ))
-        NSGradient(colors: [
-            NSColor(calibratedRed: 0.45, green: 0.26, blue: 0.10, alpha: 0.32),
-            NSColor(calibratedRed: 0.45, green: 0.26, blue: 0.10, alpha: 0)
-        ])?.draw(in: bounce, angle: 90)
-
-        // Horizon band — a thin environment reflection.
-        let band = NSBezierPath(ovalIn: NSRect(
-            x: p.x - r * 0.78,
-            y: p.y - r * 0.08,
-            width: r * 1.56,
-            height: r * 0.22
-        ))
-        NSColor(calibratedWhite: 1, alpha: 0.10).setFill()
-        band.fill()
-
-        // Neighbor occlusion: darken the side facing a close ball.
-        if index > 0 {
-            let left = sim.balls[index - 1]
-            let gap = CGFloat(b.position.x - left.position.x) - r - CGFloat(left.radius)
-            let closeness = max(0, 1 - gap / (r * 0.55))
-            if closeness > 0.05 {
-                NSColor(calibratedWhite: 0, alpha: 0.22 * closeness).setFill()
-                NSBezierPath(ovalIn: NSRect(x: p.x - r * 0.95, y: p.y - r * 0.55, width: r * 0.55, height: r * 1.1)).fill()
-            }
+    private func placeWire(_ node: SCNNode, from a: SCNVector3, to b: SCNVector3, radius: CGFloat) {
+        let dx = b.x - a.x, dy = b.y - a.y, dz = b.z - a.z
+        let h = CGFloat(sqrt(dx * dx + dy * dy + dz * dz))
+        guard h > 0.5 else { return }
+        node.position = SCNVector3((a.x + b.x) * 0.5, (a.y + b.y) * 0.5, (a.z + b.z) * 0.5)
+        node.scale = SCNVector3(radius, h, radius)
+        let dir = simd_normalize(simd_float3(Float(dx), Float(dy), Float(dz)))
+        let yAxis = simd_float3(0, 1, 0)
+        let dot = simd_dot(yAxis, dir)
+        if dot > 0.999 {
+            node.simdOrientation = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
+        } else if dot < -0.999 {
+            node.simdOrientation = simd_quatf(angle: .pi, axis: simd_float3(1, 0, 0))
+        } else {
+            node.simdOrientation = simd_quatf(from: yAxis, to: dir)
         }
-        if index + 1 < sim.balls.count {
-            let right = sim.balls[index + 1]
-            let gap = CGFloat(right.position.x - b.position.x) - r - CGFloat(right.radius)
-            let closeness = max(0, 1 - gap / (r * 0.55))
-            if closeness > 0.05 {
-                NSColor(calibratedWhite: 0, alpha: 0.22 * closeness).setFill()
-                NSBezierPath(ovalIn: NSRect(x: p.x + r * 0.40, y: p.y - r * 0.55, width: r * 0.55, height: r * 1.1)).fill()
-            }
-        }
-
-        // Window specular.
-        let spec = NSBezierPath(ovalIn: NSRect(
-            x: p.x - r * 0.50,
-            y: p.y + r * 0.22,
-            width: r * 0.52,
-            height: r * 0.34
-        ))
-        NSGradient(colors: [
-            NSColor(calibratedWhite: 1, alpha: 0.92),
-            NSColor(calibratedWhite: 1, alpha: 0)
-        ])?.draw(in: spec, angle: -90)
-
-        // Secondary glint.
-        NSColor(calibratedWhite: 1, alpha: 0.28).setFill()
-        NSBezierPath(ovalIn: NSRect(
-            x: p.x + r * 0.28,
-            y: p.y - r * 0.12,
-            width: r * 0.16,
-            height: r * 0.12
-        )).fill()
-
-        // Rim
-        let rim = NSBezierPath(ovalIn: rect.insetBy(dx: 0.5, dy: 0.5))
-        rim.lineWidth = max(0.8, r * 0.028)
-        NSColor(calibratedWhite: 0, alpha: 0.35).setStroke()
-        rim.stroke()
-        NSColor(calibratedWhite: 1, alpha: 0.12).setStroke()
-        NSBezierPath(ovalIn: rect.insetBy(dx: r * 0.04, dy: r * 0.04)).stroke()
     }
-}
 
-private extension NSBezierPath {
-    func fill(with color: NSColor) {
-        color.setFill()
-        fill()
+    // MARK: - Materials
+
+    private func chromeMaterial() -> SCNMaterial {
+        let m = SCNMaterial()
+        m.lightingModel = .physicallyBased
+        m.diffuse.contents = NSColor(calibratedWhite: 0.92, alpha: 1)
+        m.metalness.contents = 1.0
+        m.roughness.contents = Bundle.main.url(forResource: "chrome_rough", withExtension: "png")
+            ?? NSNumber(value: 0.12)
+        m.roughness.intensity = 1.0
+        return m
+    }
+
+    private func brassMaterial() -> SCNMaterial {
+        let m = SCNMaterial()
+        m.lightingModel = .physicallyBased
+        m.diffuse.contents = NSColor(calibratedRed: 0.78, green: 0.55, blue: 0.22, alpha: 1)
+        m.metalness.contents = 1.0
+        m.roughness.contents = 0.32
+        return m
+    }
+
+    private func steelMaterial() -> SCNMaterial {
+        let m = SCNMaterial()
+        m.lightingModel = .physicallyBased
+        m.diffuse.contents = NSColor(calibratedRed: 0.55, green: 0.54, blue: 0.52, alpha: 1)
+        m.metalness.contents = 1.0
+        m.roughness.contents = 0.28
+        return m
+    }
+
+    private func wireMaterial() -> SCNMaterial {
+        let m = SCNMaterial()
+        m.lightingModel = .physicallyBased
+        m.diffuse.contents = NSColor(calibratedRed: 0.42, green: 0.40, blue: 0.36, alpha: 1)
+        m.metalness.contents = 0.95
+        m.roughness.contents = 0.38
+        return m
+    }
+
+    private func woodMaterial(repeat n: CGFloat) -> SCNMaterial {
+        let m = SCNMaterial()
+        m.lightingModel = .physicallyBased
+        m.diffuse.contents = Bundle.main.url(forResource: "wood", withExtension: "jpg")
+            ?? NSColor(calibratedRed: 0.25, green: 0.14, blue: 0.07, alpha: 1)
+        m.roughness.contents = Bundle.main.url(forResource: "wood_rough", withExtension: "jpg")
+            ?? NSNumber(value: 0.72)
+        m.metalness.contents = 0.0
+        m.diffuse.wrapS = .repeat
+        m.diffuse.wrapT = .repeat
+        m.roughness.wrapS = .repeat
+        m.roughness.wrapT = .repeat
+        m.diffuse.contentsTransform = SCNMatrix4MakeScale(n, n, 1)
+        m.roughness.contentsTransform = SCNMatrix4MakeScale(n, n, 1)
+        return m
     }
 }

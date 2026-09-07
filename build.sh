@@ -17,11 +17,14 @@ cp Info.plist "$APP/Contents/Info.plist"
 if [ -f AppIcon.icns ]; then
     cp AppIcon.icns "$RES_DIR/AppIcon.icns"
 fi
+if [ -d Resources ]; then
+    cp Resources/* "$RES_DIR/" 2>/dev/null || true
+fi
 
 echo "Compiling for $(uname -m)..."
 swiftc -O -swift-version 5 \
     -framework Cocoa -framework CoreMotion -framework QuartzCore \
-    -framework IOKit -framework GameController \
+    -framework IOKit -framework GameController -framework SceneKit \
     -o "$BIN_DIR/NewtonsCradle" \
     Physics.swift MotionInput.swift CradleView.swift WallpaperWindow.swift AppController.swift main.swift
 
